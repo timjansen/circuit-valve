@@ -208,12 +208,10 @@ export function createValve(opts: ValveOptions): Valve {
                     break;
                 } catch (err: any) {
                     lastError = err;
-                    if (!failByEx)
+                    if (!failByEx && err.message != 'cv-timeout')
                         break;
                     elapsedRetries += now() - start;
                     consecFailures++;
-                    if (err.message == 'cv-timeout')
-                        break;
                     if (attempt == retries || elapsedRetries > options.retryTimeoutS || failureRate() > options.retryOnlyIfFailPctUnder)
                         break;
                     continue;
