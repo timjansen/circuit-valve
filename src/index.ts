@@ -177,8 +177,8 @@ export function createValve(opts: ValveOptions): Valve {
             if (circuitOpenUntil && now() >= circuitOpenUntil) {
                 circuitOpenUntil = 0;
                 consecFailures = 0;
-                dynamicReqPerS = options.maxReqPerSecond;
-                dynamicSimul = options.maxSimultaneousRequests;
+                dynamicReqPerS = options.reopenWithReqPerS ?? options.maxReqPerSecond;
+                dynamicSimul = options.reopenWithSimultanousRequests ?? options.maxSimultaneousRequests;
                 lastSoftCheck = now();
             }
 
@@ -232,7 +232,7 @@ export function createValve(opts: ValveOptions): Valve {
             // after execution
             prune();
             // circuit breaker
-            if (consecFailures >= options.fullCloseAfterNFailures || failureRate() >= options.fullCloseOnFailPercentage) {
+            if (consecFailures >= options.fullCloseAfterNFailures || failureRate() > options.fullCloseOnFailPercentage) {
                 openCircuit();
             }
             if (success) {

@@ -145,3 +145,112 @@ describe('Soft break functionality', () => {
     await expect(wrapped2()).rejects.toBeInstanceOf(RateLimitedException);
   });
 });
+
+describe('CircuitBreaker with fullCloseOnFailPercentage', () => {
+  let fakeTime: number;
+  let advance: (s: number) => void;
+  let nowFn: () => number;
+  beforeEach(() => {
+    fakeTime = 1000;
+    advance = (s: number) => { fakeTime += s; };
+    nowFn = () => fakeTime;
+  });
+
+  it('opens circuit when failure percentage exceeds threshold', async () => {
+    const valve = createValve({
+      fullCloseOnFailPercentage: 50, // 50% failure threshold
+      controlPeriodS: 2,
+      nowFn
+    });
+    const sometimesFail = async (fail: boolean) => {
+      if (fail) throw new Error('fail');
+      return 'ok';
+    };
+    const wrapped = valve.add(sometimesFail);
+
+    // 4 requests: 2 fail, 2 succeed (50% fail, should not open)
+    await expect(wrapped(false)).resolves.toBe('ok');
+    await expect(wrapped(true)).rejects.toThrow('fail');
+    await expect(wrapped(false)).resolves.toBe('ok');
+    await expect(wrapped(true)).rejects.toThrow('fail');
+    // Next request, still at threshold, should not open
+    await expect(wrapped(false)).resolves.toBe('ok');
+    // Add one more fail to exceed threshold (3/6 = 50%, still not above)
+    await expect(wrapped(true)).rejects.toThrow('fail');
+    // Add one more fail to go above threshold (4/7 > 50%)
+    await expect(wrapped(true)).rejects.toThrow('fail');
+    // Now, circuit should be open
+    await expect(wrapped(false)).rejects.toBeInstanceOf(CircuitBreakerException);
+  });
+});
+
+describe('CircuitBreaker reopenWithReqPerS and reopenWithSimultanousRequests', () => {
+  let fakeTime: number;
+  let advance: (s: number) => void;
+  let nowFn: () => number;
+  beforeEach(() => {
+    fakeTime = 1000;
+    advance = (s: number) => { fakeTime += s; };
+    nowFn = () => fakeTime;
+  });
+
+  it('applies reopenWithReqPerS and reopenWithSimultanousRequests after full close', async () => {
+    const valve = createValve({
+      fullCloseAfterNFailures: 2,
+      fullCloseDurationS: 1,
+      maxReqPerSecond: 10,
+      maxSimultaneousRequests: 5,
+      reopenWithReqPerS: 2,
+      reopenWithSimultanousRequests: 1,
+      controlPeriodS: 1,
+      nowFn
+    });
+    const alwaysFail = async () => { throw new Error('fail'); };
+    const wrapped = valve.add(alwaysFail);
+
+    // Trigger full close
+    await expect(wrapped()).rejects.toThrow('fail');
+    await expect(wrapped()).rejects.toThrow('fail');
+    await expect(wrapped()).rejects.toBeInstanceOf(CircuitBreakerException);
+    console.log('2');
+    // Advance time to after full close duration
+    advance(1.1);
+    // Now, circuit should allow calls again, but with reduced limits
+    // Fill up the single allowed simultaneous request
+    let resolveFirst: (() => void) | undefined;
+    const slow = () => new Promise<void>(res => { resolveFirst = res; });
+    const wrappedSlow = valve.add(slow);
+    const p = wrappedSlow();
+    let rateLimited = false;
+    console.log('3');
+    try {
+      await expect(wrappedSlow()).rejects.toBeInstanceOf(RateLimitedException);
+      console.log('3.1');
+      rateLimited = true;
+    } finally {
+      console.log('3.2');
+      if (resolveFirst) resolveFirst();
+      console.log('3.3');
+      await p;
+    }
+    console.log('4');
+    expect(rateLimited).toBe(true);
+    // Now, test rate limit: only 2 per second allowed
+    advance(5);
+    const fast = async () => 'ok';
+    const wrappedFast = valve.add(fast);
+    await wrappedFast();
+    // Advance time slightly to simulate real requests within the same second
+    advance(0.1);
+    await wrappedFast();
+    advance(0.1);
+    console.log('7');
+    await expect(wrappedFast()).rejects.toBeInstanceOf(RateLimitedException);
+    console.log('8');
+    // Advance time to clear buffer, should allow again
+    advance(1.1);
+    console.log('9');
+    await expect(wrappedFast()).resolves.toBe('ok');
+    console.log('9.1');
+  }, 1500); // 1.5s timeout for this test
+});
