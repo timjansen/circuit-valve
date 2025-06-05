@@ -65,6 +65,9 @@ export interface ValveOptions {
     maxRetryCount?: number; // if >0, will be retried this often on exception (default: 0, never retry)
     retryOnlyIfFailPctUnder?: number; // if set, you can limit the use of the retry mechanism to be used only when the fail rate is below the given percentage
     retryTimeoutS?: number;           // if set, a retry is only attempted if previous retry attempts took less that this duration (in seconds)
+
+    // For testing: allow injecting a custom time function
+    nowFn?: () => number; // For testing: allow injecting a custom time function
 }
 
 export interface Valve {
@@ -73,7 +76,7 @@ export interface Valve {
 
 export function createValve(opts: ValveOptions): Valve {
     // defaults
-    const options: Required<Omit<ValveOptions, 'reopenWithReqPerS' | 'reopenWithSimultanousRequests'>> & Pick<ValveOptions, 'reopenWithReqPerS' | 'reopenWithSimultanousRequests'> = {
+    const options = {
         controlPeriodS: 5,
         controlPeriodMaxRequests: 1000,
         maxReqPerSecond: Infinity,
@@ -99,6 +102,7 @@ export function createValve(opts: ValveOptions): Valve {
         maxRetryCount: 0,
         retryOnlyIfFailPctUnder: 100,
         retryTimeoutS: Infinity,
+        nowFn: undefined,
         ...opts
     };
 
@@ -113,7 +117,7 @@ export function createValve(opts: ValveOptions): Valve {
     let lastSoftCheck = 0;
 
     function now() {
-        return Date.now() / 1000;
+        return options.nowFn ? options.nowFn() : Date.now() / 1000;
     }
 
     function prune() {
