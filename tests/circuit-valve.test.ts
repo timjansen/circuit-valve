@@ -254,3 +254,129 @@ describe('CircuitBreaker reopenWithReqPerS and reopenWithSimultanousRequests', (
     console.log('9.1');
   }, 1500); // 1.5s timeout for this test
 });
+
+describe('Soft break recovers and increases dynamicReqPerS as fail rate drops', () => {
+  let fakeTime: number;
+  let advance: (s: number) => void;
+  let nowFn: () => number;
+  beforeEach(() => {
+    fakeTime = 1000;
+    advance = (s: number) => { fakeTime += s; };
+    nowFn = () => fakeTime;
+  });
+
+  it('increases dynamicReqPerS as failure rate drops below softBreakFailMaxPercentage', async () => {
+    const valve = createValve({
+      maxReqPerSecond: 10,
+      minReqPerSecond: 2,
+      softBreakFailMinPercentage: 50, // If >50% fail, reduce rate
+      softBreakReqDecreaseFactor: 0.5, // Halve the rate
+      softBreakFailMaxPercentage: 10, // If <10% fail, increase rate
+      softBreakReqIncreaseFactor: 2, // Double the rate when recovering
+      controlPeriodS: 2,
+      softBreakCheckAfterS: 0, // Always allow soft break check
+      nowFn
+    });
+    // Fail enough to trigger soft break
+    const alwaysFail = async () => { throw new Error('fail'); };
+    const wrappedFail = valve.add(alwaysFail);
+    for (let i = 0; i < 4; i++) {
+      await expect(wrappedFail()).rejects.toThrow('fail');
+      advance(0.5);
+    }
+    // Succeed enough to drop fail rate
+    advance(2); // Move out of failure window
+    const alwaysSucceed = async () => 'ok';
+    const wrappedSucceed = valve.add(alwaysSucceed);
+    for (let i = 0; i < 10; i++) {
+      await expect(wrappedSucceed()).resolves.toBe('ok');
+      advance(0.2);
+    }
+    // Make a dummy call to trigger soft break check
+    await wrappedSucceed();
+    // Now, dynamicReqPerS should have increased (doubled from the reduced value, but not above maxReqPerSecond)
+    // We can't access dynamicReqPerS directly, so we test by making requests in a tight window
+    let allowed = 0;
+    for (let i = 0; i < 5; i++) {
+      try {
+        await wrappedSucceed();
+        allowed++;
+      } catch (e) {
+        break;
+      }
+    }
+    expect(allowed).toBeGreaterThan(2); // Should be more than the reduced rate (2)
+  });
+});
+
+describe('Soft break reduces dynamicReqPerS as fail rate increases, increases dynamicReqPerS as fail rate decreases', () => {
+  let fakeTime: number;
+  let advance: (s: number) => void;
+  let nowFn: () => number;
+  beforeEach(() => {
+    fakeTime = 1000;
+    advance = (s: number) => { fakeTime += s; };
+    nowFn = () => fakeTime;
+  });
+
+  it('dynamicReqPerS following fail rate', async () => {
+    const valve = createValve({
+      maxReqPerSecond: 10,
+      minReqPerSecond: 2,
+      softBreakFailMinPercentage: 50, // If >50% fail, reduce rate
+      softBreakReqDecreaseFactor: 0.5, // Halve the rate
+      softBreakFailMaxPercentage: 10, // If <10% fail, increase rate
+      softBreakReqIncreaseFactor: 2, // Double the rate when recovering
+      controlPeriodS: 2,
+      softBreakCheckAfterS: 2,
+      nowFn
+    });
+    // Succeed enough to keep fail rate low initially
+    const alwaysSucceed = async () => 'ok';
+    const wrappedSucceed = valve.add(alwaysSucceed);
+    for (let i = 0; i < 4; i++) {
+      await expect(wrappedSucceed()).resolves.toBe('ok');
+      advance(0.5);
+    }
+    // Fail enough to trigger soft break
+    advance(2); // Move out of success window
+    const alwaysFail = async () => { throw new Error('fail'); };
+    const wrappedFail = valve.add(alwaysFail);
+    for (let i = 0; i < 4; i++) {
+      await expect(wrappedFail()).rejects.toThrow('fail');
+      advance(0.5);
+    }
+    // Make a dummy call to trigger soft break check (all failures are still within controlPeriodS)
+    await wrappedFail().catch(() => {});
+    // Now, dynamicReqPerS should have decreased (halved from the max value, but not below minReqPerSecond)
+    let allowed = 0;
+    for (let i = 0; i < 10; i++) {
+      try {
+        await wrappedSucceed();
+        allowed++;
+      } catch (e) {
+        break;
+      }
+    }
+    expect(allowed).toBeLessThanOrEqual(5); // Should be less than the max rate (10 per 2s window)
+    expect(allowed).toBeGreaterThanOrEqual(2); // But not less than minReqPerSecond
+
+    advance(1); // Move out of failure window
+    await expect(wrappedSucceed()).resolves.toBe('ok');
+    advance(1); // Move out of failure window
+    await expect(wrappedSucceed()).resolves.toBe('ok');
+    advance(2); // Move out of success window
+    // Now should be unthrottled again
+    allowed = 0;
+        for (let i = 0; i < 10; i++) {
+      try {
+        await wrappedSucceed();
+        allowed++;
+      } catch (e) {
+        break;
+      }
+    }
+    expect(allowed).toEqual(10);
+
+  });
+});
