@@ -1,6 +1,6 @@
 {
   "name": "circuit-valve",
-  "version": "1.0.0",
+  "version": "0.0.1",
   "description": "Circuit Valve is a TypeScript library for backend services. It is half circuit-breaker, half rate limiter, and includes a retry mechanism.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
