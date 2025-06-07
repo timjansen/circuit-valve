@@ -1,4 +1,4 @@
-import { createValve, RateLimitedException, CircuitBreakerException } from '../src/index';
+import { createValve, ValveEventReporter, CircuitBreakerException, RateLimitedException } from '../src/index';
 
 describe('CircuitValve Rate Limiter', () => {
   let fakeTime: number;
@@ -11,7 +11,7 @@ describe('CircuitValve Rate Limiter', () => {
   });
 
   it('throws RateLimitedException when maximum simultaneous requests exceeded', async () => {
-    const valve = createValve({ maxSimultaneousRequests: 1, nowFn });
+    const valve = createValve({ name: 'simul', maxSimultaneousRequests: 1, maxReqPerSecond: 1000, controlPeriodS: 1, nowFn });
     const asyncTask = () => new Promise(resolve => setTimeout(() => resolve('done'), 1));
     const wrapped = valve.add(asyncTask);
 
@@ -22,7 +22,7 @@ describe('CircuitValve Rate Limiter', () => {
   });
 
   it('throws RateLimitedException when requests per second exceeded', async () => {
-    const valve = createValve({ maxReqPerSecond: 1, controlPeriodS: 1, nowFn });
+    const valve = createValve({ name: 'reqps', maxReqPerSecond: 1, controlPeriodS: 1, nowFn });
     const fast = async () => 'ok';
     const wrapped = valve.add(fast);
 
@@ -49,7 +49,7 @@ describe('CircuitBreaker', () => {
   });
 
   it('opens circuit after consecutive failures', async () => {
-    const valve = createValve({ fullCloseAfterNFailures: 2, fullCloseDurationS: 1, nowFn });
+    const valve = createValve({ name: 'cb-nfail', fullCloseAfterNFailures: 2, fullCloseDurationS: 1, maxReqPerSecond: 1000, controlPeriodS: 1, nowFn });
     let count = 0;
     const failing = async () => { count++; throw new Error('fail'); };
     const wrapped = valve.add(failing);
@@ -62,7 +62,7 @@ describe('CircuitBreaker', () => {
   });
 
   it('closes circuit after fullCloseDurationS and allows calls again', async () => {
-    const valve = createValve({ fullCloseAfterNFailures: 1, fullCloseDurationS: 1, nowFn });
+    const valve = createValve({ name: 'cb-close', fullCloseAfterNFailures: 1, fullCloseDurationS: 1, maxReqPerSecond: 1000, controlPeriodS: 1, nowFn });
     const failing = async () => { throw new Error('fail'); };
     const wrapped = valve.add(failing);
 
@@ -86,7 +86,7 @@ describe('Retry mechanism', () => {
   });
 
   it('retries on failure and succeeds', async () => {
-    const valve = createValve({ maxRetryCount: 2, nowFn });
+    const valve = createValve({ name: 'retry', maxRetryCount: 2, maxReqPerSecond: 1000, controlPeriodS: 1, nowFn });
     let attempts = 0;
     const sometimesFail = async () => {
       attempts++;
@@ -115,6 +115,7 @@ describe('Soft break functionality', () => {
 
   it('reduces allowed request rate when failure percentage exceeds threshold', async () => {
     const valve = createValve({
+      name: 'softbreak',
       maxReqPerSecond: 10,
       minReqPerSecond: 2,
       softBreakFailMinPercentage: 50, // If >50% fail, reduce rate
@@ -158,8 +159,11 @@ describe('CircuitBreaker with fullCloseOnFailPercentage', () => {
 
   it('opens circuit when failure percentage exceeds threshold', async () => {
     const valve = createValve({
+      name: 'cb-failpct',
       fullCloseOnFailPercentage: 50, // 50% failure threshold
       controlPeriodS: 2,
+      controlPeriodMaxRequests: 2000,
+      maxReqPerSecond: 1000,
       nowFn
     });
     const sometimesFail = async (fail: boolean) => {
@@ -196,6 +200,7 @@ describe('CircuitBreaker reopenWithReqPerS and reopenWithSimultanousRequests', (
 
   it('applies reopenWithReqPerS and reopenWithSimultanousRequests after full close', async () => {
     const valve = createValve({
+      name: 'cb-reopen',
       fullCloseAfterNFailures: 2,
       fullCloseDurationS: 1,
       maxReqPerSecond: 10,
@@ -267,6 +272,7 @@ describe('Soft break recovers and increases dynamicReqPerS as fail rate drops', 
 
   it('increases dynamicReqPerS as failure rate drops below softBreakFailMaxPercentage', async () => {
     const valve = createValve({
+      name: 'softbreak-increase',
       maxReqPerSecond: 10,
       minReqPerSecond: 2,
       softBreakFailMinPercentage: 50, // If >50% fail, reduce rate
@@ -321,6 +327,7 @@ describe('Soft break reduces dynamicReqPerS as fail rate increases, increases dy
 
   it('dynamicReqPerS following fail rate', async () => {
     const valve = createValve({
+      name: 'softbreak-follow',
       maxReqPerSecond: 10,
       minReqPerSecond: 2,
       softBreakFailMinPercentage: 50, // If >50% fail, reduce rate
@@ -368,7 +375,7 @@ describe('Soft break reduces dynamicReqPerS as fail rate increases, increases dy
     advance(2); // Move out of success window
     // Now should be unthrottled again
     allowed = 0;
-        for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 10; i++) {
       try {
         await wrappedSucceed();
         allowed++;
@@ -377,6 +384,171 @@ describe('Soft break reduces dynamicReqPerS as fail rate increases, increases dy
       }
     }
     expect(allowed).toEqual(10);
+  });
+});
 
+describe('ValveEventReporter integration', () => {
+    let events: Record<string, any[]>;
+    let reporter: ValveEventReporter;
+    beforeEach(() => {
+        events = {
+            highFailureRate: [],
+            retry: [],
+            circuitOpen: [],
+            circuitClose: [],
+            rateLimit: []
+        };
+        reporter = {
+            onHighFailureRate: (failureRate, options) => events.highFailureRate.push({ failureRate }),
+            onRetry: (attempt, error, options) => events.retry.push({ attempt, error }),
+            onCircuitOpen: (duration, options) => events.circuitOpen.push({ duration }),
+            onCircuitClose: (options) => events.circuitClose.push({}),
+            onRateLimit: (type, current, limit, options) => events.rateLimit.push({ type, current, limit })
+        };
+    });
+
+    it('should report retry events', async () => {
+        const valve = createValve({ name: 'event-retry', maxRetryCount: 1, eventReporter: reporter, maxReqPerSecond: 1000, controlPeriodS: 1 });
+        let failCount = 0;
+        const fn = jest.fn(async () => {
+            failCount++;
+            throw new Error('fail');
+        });
+        const wrapped = valve.add(fn);
+        await expect(wrapped()).rejects.toThrow('fail');
+        expect(events.retry.length).toBe(1);
+        expect(events.retry[0].attempt).toBe(1);
+    });
+
+    it('should report high failure rate', async () => {
+        const valve = createValve({
+            name: 'event-highfail',
+            controlPeriodS: 1,
+            controlPeriodMaxRequests: 1000,
+            softBreakFailMinPercentage: 10,
+            eventReporter: reporter,
+            maxReqPerSecond: 1000
+        });
+        const fn = jest.fn(async () => { throw new Error('fail'); });
+        const wrapped = valve.add(fn);
+        await expect(wrapped()).rejects.toThrow('fail');
+        expect(events.highFailureRate.length).toBeGreaterThanOrEqual(1);
+        expect(events.highFailureRate[0].failureRate).toBeGreaterThanOrEqual(100);
+    });
+
+    it('should report circuit open and close', async () => {
+        const valve = createValve({
+            name: 'event-circuit',
+            fullCloseAfterNFailures: 1,
+            fullCloseDurationS: 0.1,
+            eventReporter: reporter,
+            maxReqPerSecond: 1000, controlPeriodS: 1
+        });
+        const fn = jest.fn(async () => { throw new Error('fail'); });
+        const wrapped = valve.add(fn);
+        // First call triggers circuit open
+        await expect(wrapped()).rejects.toThrow('fail');
+        expect(events.circuitOpen.length).toBe(1);
+        // Next call while circuit is open throws CircuitBreakerException
+        await expect(wrapped()).rejects.toThrow(CircuitBreakerException);
+        // Wait for circuit to close
+        await new Promise(res => setTimeout(res, 120));
+        // Next call triggers circuit close event
+        try { await wrapped(); } catch {}
+        expect(events.circuitClose.length).toBe(1);
+    });
+
+    it('should report rate limit events', async () => {
+        const valve = createValve({
+            name: 'event-ratelimit',
+            maxReqPerSecond: 1,
+            maxSimultaneousRequests: 1,
+            controlPeriodS: 1,
+            eventReporter: reporter
+        });
+        const fn = jest.fn(async () => new Promise(res => setTimeout(res, 50)));
+        const wrapped = valve.add(fn);
+        // Start one request
+        const p1 = wrapped();
+        // Immediately start another to trigger simultaneous limit
+        await expect(wrapped()).rejects.toThrow(RateLimitedException);
+        // Wait for the first to finish
+        await p1;
+        // Exceed reqPerS by calling again quickly
+        await expect(wrapped()).rejects.toThrow(RateLimitedException);
+        expect(events.rateLimit.length).toBeGreaterThanOrEqual(2);
+        const types = events.rateLimit.map(e => e.type);
+        expect(types).toContain('simultaneous');
+        expect(types).toContain('reqPerS');
+    });
+});
+
+describe('ValveOptions config validation', () => {
+  it('throws if maxReqPerSecond is too high for controlPeriodMaxRequests/controlPeriodS', () => {
+    expect(() => createValve({
+      name: 'bad-config',
+      maxReqPerSecond: 11,
+      controlPeriodMaxRequests: 20,
+      controlPeriodS: 2
+    })).toThrow(/controlPeriodMaxRequests.*too small/);
+  });
+});
+
+describe('ValveGuard Decorator', () => {
+  beforeEach(() => {
+    // Clean up registry before each test
+    const { removeValve } = require('../src/index');
+    removeValve('decorator-test');
+  });
+
+  it('wraps a class method and enforces rate limiting', async () => {
+    const { createValve, ValveGuard, RateLimitedException } = require('../src/index');
+    createValve({ name: 'decorator-test', maxReqPerSecond: 1, controlPeriodS: 1 });
+
+    class Service {
+      @ValveGuard('decorator-test')
+      async doWork(x: number) {
+        return x * 2;
+      }
+    }
+    const svc = new Service();
+    expect(await svc.doWork(2)).toBe(4);
+    // Second call in same second should be rate limited
+    await expect(svc.doWork(3)).rejects.toBeInstanceOf(RateLimitedException);
+  });
+
+  it('wraps a standalone function and enforces rate limiting', async () => {
+    const { createValve, ValveGuard, RateLimitedException } = require('../src/index');
+    createValve({ name: 'decorator-test', maxReqPerSecond: 1, controlPeriodS: 1 });
+    const fn = ValveGuard('decorator-test')(async (x: number) => x + 1);
+    expect(await fn(1)).toBe(2);
+    await expect(fn(2)).rejects.toBeInstanceOf(RateLimitedException);
+  });
+
+  it('throws if valve does not exist', async () => {
+    const { ValveGuard } = require('../src/index');
+    class S {
+      @ValveGuard('nope')
+      async fail() { return 1; }
+    }
+    const s = new S();
+    let error: any;
+    try {
+      await s.fail();
+    } catch (e) {
+      error = e;
+    }
+    expect(error).toBeDefined();
+    expect((error as Error).message).toMatch(/not found/);
+    // Standalone
+    error = undefined;
+    let fn: any;
+    try {
+      fn = ValveGuard('nope')(async () => 1);
+    } catch (e) {
+      error = e;
+    }
+    expect(error).toBeDefined();
+    expect((error as Error).message).toMatch(/not found/);
   });
 });
