@@ -362,9 +362,16 @@ export function createValve(opts: ValveOptions): Valve {
         valve: { add }
     };
     // happy-server integration
-    if (typeof (globalThis as any).happyServerExtension === 'object' && (globalThis as any).happyServerExtension) {
-        (globalThis as any).happyServerExtension[`circuit-valve-${options.name}`] = () => circuitValveRegistry[options.name].getStats();
+
+    function registerHappyServerExtension(): boolean {
+        if (typeof (globalThis as any).happyServerExtension === 'object' && (globalThis as any).happyServerExtension) {
+            (globalThis as any).happyServerExtension[`circuit-valve-${options.name}`] = () => circuitValveRegistry[options.name].getStats();
+            return true;
+        }
+        return false;
     }
+    if (!registerHappyServerExtension())
+        setTimeout(registerHappyServerExtension, 3000);
 
     return {
         add
